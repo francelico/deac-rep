@@ -18,7 +18,7 @@ Finally, each algorithm supports the following representation learning methods, 
 
 We provide utilities to measure the information agent trajectories and learned latents carry about the environment (refer to the paper and [mutual_info_procgen_eval.py](procgen_experiments/eval_utils/mutual_info_procgen_eval.py) for a description of each metric and reference implementation). We also re-implement in JAX representation learning metrics first proposed in [Investigating the Properties of Neural Network Representations in Reinforcement Learning](https://arxiv.org/abs/2203.15955), see [repmetric_util.py](procgen_experiments/utils/repmetric_util.py).
 
-Our experiment logs and data are publicly available in our [wandb project](TODO). The trained model checkpoints are accessible from our [model repository](TODO). When downloading experiment data, we strongly recommend relying on the `.tfevents` files stored in the wandb repository for each run. We found `.tfevents` files less likely to drop data than the data streamed through the wandb API and displayed in the web interface. The `.tfevents` files can be downloaded, merged and converted to a pandas dataframe using utilities provided in [log_util.py](procgen_experiments/utils/log_util.py).
+Our experiment logs and data are publicly available in our [Procgen](https://wandb.ai/francelico/deac-rep-procgen-R/table?nw=r2kcldgbwxg) and [PixelBrax](TODO) wandb projects. The trained model checkpoints are accessible from our [model repository](TODO). When downloading experiment data, we strongly recommend relying on the `.tfevents` files stored in the wandb repository for each run. We found `.tfevents` files less likely to drop data than the data streamed through the wandb API and displayed in the web interface. The `.tfevents` files can be downloaded, merged and converted to a pandas dataframe using utilities provided in [log_util.py](procgen_experiments/utils/log_util.py).
 
 ## Installation instructions
 Please refer to the README files in the `procgen_experiments` and `pixelbrax_experiments` directories for instructions on how to set up the dependencies and run experiments.
@@ -37,6 +37,6 @@ url={https://openreview.net/forum?id=tErHYBGlWc}
 ```
 
 ## TODO
-- [ ] Add wandb project link
+- [ ] Add wandb project links for [Procgen](https://wandb.ai/francelico/deac-rep-procgen-R/table?nw=r2kcldgbwxg) and PixelBrax
 - [ ] Add model repository link
 - [ ] Add pixelbrax experiments
