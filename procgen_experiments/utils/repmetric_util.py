@@ -1,10 +1,11 @@
-import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from utils.constants import EPSILON
 from . import l2, absolute_diff, pairwise_similarities, cosine_similarity
+
+# metrics reproduced from https://arxiv.org/abs/2203.15955
 
 def complexity_reduction(Lrep, Lmax):
   """Computes the reduction in complexity of the value function due to the representation function.
