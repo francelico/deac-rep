@@ -7,6 +7,7 @@ In each benchmark we provide JAX implementations for the following algorithms:
 - [Proximal Policy Optimisation (PPO)](https://arxiv.org/abs/1707.06347)
 - [Phasic Policy Gradient (PPG)](https://arxiv.org/abs/2009.04416)
 - [Delayed Critic Policy Gradient (DCPG)](https://arxiv.org/abs/2210.09960)
+
 We follow the [CleanRL](https://github.com/vwxyzjn/cleanrl) structure and implement each algorithm/environment pair in a separate file. Additionally, we provide `_shared` and `_sep` versions of each algorithm, referring to shared and decoupled actor-critic architectures studied in the paper.
 
 Finally, each algorithm supports the following representation learning methods, which may be applied to the actor, critic, or both:
@@ -37,6 +38,7 @@ url={https://openreview.net/forum?id=tErHYBGlWc}
 ```
 
 ## TODO
-- [ ] Add wandb project links for [Procgen](https://wandb.ai/francelico/deac-rep-procgen-R/table?nw=r2kcldgbwxg) and PixelBrax
-- [ ] Add model repository link
+- [x] Add wandb project link for [Procgen](https://wandb.ai/francelico/deac-rep-procgen-R/table?nw=r2kcldgbwxg)
+- [ ] Add wandb project link for PixelBrax
+- [ ] Add model checkpoint repository link
 - [ ] Add pixelbrax experiments
