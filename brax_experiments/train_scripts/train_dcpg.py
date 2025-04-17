@@ -1,3 +1,4 @@
+from multiprocessing import Value
 import os
 import gc
 import queue
@@ -27,9 +28,12 @@ from flax.training.train_state import TrainState
 
 from rich.pretty import pprint
 from tensorboardX import SummaryWriter
-from brax.training.distribution import NormalTanhDistribution
+from flax.training import checkpoints
 
-from eval_utils.env_utils import make_pixel_brax, RewardWrapper, RunningMeanStd
+from brax.training.distribution import NormalTanhDistribution, ParametricDistribution
+
+
+#from eval_utils.env_utils import make_pixel_brax, RewardWrapper, RunningMeanStd
 from utils.utils import (
     set_layer_init_fn,
     binary_cross_entropy_with_logits,
@@ -39,8 +43,9 @@ from utils.utils import (
 import utils.job_util
 import utils.repmetric_util
 import utils.bisim_util
-
 """ARGS"""
+
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__).rstrip(".py")
@@ -88,6 +93,7 @@ class Args:
     "eval returns to break training to record video"
     do_recording: bool = False
     "do recording?"
+    v_dist_coef: float = 1.0
 
     # Environment specific arguments
     env_id: str = "ant"
@@ -200,6 +206,8 @@ class Args:
     aux_vf_coef_aux_phase: float = 1.0
     adv_coef_aux_phase: float = 0.0
 
+    singular_value_targets: bool = False
+    enable_aux_vf_loss: bool = True
     do_aux_loss: bool = False
 
     # runtime arguments to be filled in
@@ -294,9 +302,6 @@ def make_ppg_model(args, envs, key, print_model=False):
         args.hiddens[-1], envs.action_size, kernel_init_dict["dyna_head_actor_dense"]
     )
     auxiliary_head = ValueHead(kernel_init_dict["auxiliary_head_dense"])
-    auxiliary_advantage_head = AdvantageHead(
-        envs.action_size, kernel_init_dict["auxiliary_advantage_head_dense"]
-    )
     critic_base = ResNetBase(args.channels, args.hiddens, kernel_init_dict)
     value_head = ValueHead(kernel_init_dict["value_head_dense"])
     dyna_head_critic = DynaHead(
@@ -322,11 +327,6 @@ def make_ppg_model(args, envs, key, print_model=False):
         actor_base_params,
         policy_head.init(policy_head_key, hidden_sample_actor),
         auxiliary_head.init(auxiliary_head_key, hidden_sample_actor),
-        auxiliary_advantage_head.init(
-            auxiliary_advantage_head_key,
-            hidden_sample_actor,
-            np.zeros(shape=(1, envs.action_size)),
-        ),
         dyna_head_actor.init(
             dyna_head_actor_key,
             hidden_sample_actor,
@@ -349,9 +349,10 @@ def make_ppg_model(args, envs, key, print_model=False):
         "actor_base": actor_base,
         "policy_head": policy_head,
         "auxiliary_head": auxiliary_head,
-        "auxiliary_advantage_head": auxiliary_advantage_head,
+        "dyna_head_actor": dyna_head_actor,
         "critic_base": critic_base,
         "value_head": value_head,
+        "dyna_head_critic": dyna_head_critic,
         "actor_distribution": actor_distribution,
     }
 
@@ -509,7 +510,6 @@ class ActorParams:
     base_params: flax.core.FrozenDict
     policy_head_params: flax.core.FrozenDict
     auxiliary_head_params: flax.core.FrozenDict
-    auxiliary_advantage_head_params: Optional[flax.core.FrozenDict] = None
     dyna_head_params: Optional[flax.core.FrozenDict] = None
 
 
@@ -579,6 +579,7 @@ class PolPhaseStorage(NamedTuple):
     actions: list
     logprobs: list
     values: list
+    aux_values: list
     env_ids: jax.Array
     rewards: list
     truncations: list
@@ -590,6 +591,7 @@ class AuxPhaseStorage(NamedTuple):
     rewards: list
     actions: list
     target_values: list
+    aux_target_values: list
     target_advantages: list
     dones: list
 
@@ -628,10 +630,7 @@ def rollout(
     start_step = global_step
     start_time = time.time()
 
-    if args.eval_every_n_log_cycles > 0:
-        pass
-    else:
-        eval_envs = None
+    eval_envs = None
 
     @partial(jax.jit, static_argnames=("eval",))
     def get_model_outputs(
@@ -691,6 +690,7 @@ def rollout(
         next_info["truncated"] = next_truncated.copy()
         next_info["reward"] = next_reward.copy()
 
+
         return (
             next_obs,
             next_reward,
@@ -705,6 +705,7 @@ def rollout(
         stats, next_info, term, trunc, cached_ep_returns, cached_ep_lengths
     ):
         cached_ep_returns += next_info["reward"]
+
         stats["ep_returns"] = jnp.where(
             next_info["terminated"] + next_info["truncated"],
             cached_ep_returns,
@@ -713,6 +714,7 @@ def rollout(
         cached_ep_returns *= (1 - next_info["terminated"]) * (
             1 - next_info["truncated"]
         )
+
 
         stats["levels_solved"] = jnp.zeros_like(next_info["terminated"])
         cached_ep_lengths += 1
@@ -747,6 +749,7 @@ def rollout(
         "env_send": jnp.zeros((1,)),
     }
     actor_policy_version = initial_policy_version
+    print(f"----------------------- resetting env ----------------------------")
     next_obs = envs.reset(envs.seed)
     next_done = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
     next_terminated = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
@@ -773,7 +776,6 @@ def rollout(
             "ep_lengths": jnp.zeros((args.local_num_envs,), dtype=jnp.int32),
             "levels_solved": jnp.zeros((args.local_num_envs,), dtype=jnp.bool_),
         }
-        
         ev_comp_times = {
             "rollout": jnp.zeros((1,)),
             "inference": jnp.zeros((1,)),
@@ -785,12 +787,21 @@ def rollout(
         ev_next_terminated = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
         ev_next_truncated = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
 
+        print(f"env_next_obs: {ev_next_obs.pixels.shape}")
+
+        if args.do_recording:
+            rendering_next_obs = rendering_env.reset(eval_envs.seed)
+            print(f"rendering_next_obs: {rendering_next_obs.pixels.shape}")
+
     @jax.jit
     def prepare_data(storage: List[PolPhaseStorage]) -> PolPhaseStorage:
         return jax.tree_map(
             lambda *xs: jnp.split(jnp.stack(xs), len(learner_devices), axis=1), *storage
         )
 
+    print(
+        f"==== Performing updates ({initial_policy_version + 1}, {args.num_updates + 2}) ===="
+    )
     for update in range(initial_policy_version + 1, args.num_updates + 2):
         update_time_start = time.time()
         params_queue_get_time_start = time.time()
@@ -825,7 +836,7 @@ def rollout(
             )
 
             inference_time_start = time.time()
-            cached_next_obs, action, logprob, value_pred, gae_pred, key = (
+            cached_next_obs, action, logprob, value_pred, aux_value_preds, key = (
                 get_model_outputs(params, cached_next_obs, key, eval=False)
             )
             comp_times["inference"] += time.time() - inference_time_start
@@ -853,6 +864,7 @@ def rollout(
                     actions=action[0],
                     logprobs=logprob,
                     values=value_pred,
+                    aux_values=aux_value_preds,
                     env_ids=jnp.zeros((args.num_envs,)),
                     rewards=next_reward,
                     truncations=cached_next_truncated,
@@ -880,7 +892,6 @@ def rollout(
                 )
             )
         )
-        # next_obs, next_done, next_terminated are still in the host
         sharded_last_obs = jax.device_put_sharded(
             jnp.split(next_obs.pixels, len(learner_devices)), devices=learner_devices
         )
@@ -906,12 +917,15 @@ def rollout(
         rollout_queue.put(payload)
         comp_times["rollout_queue_put"] += time.time() - rollout_queue_put_time_start
 
+        # Compute per-env step: args.num_steps * update
+        # e.g., num_steps=50, log_frequency=20 --> local step per env = 1k
         if update % args.log_frequency == 0:
             avg_episodic_return = jnp.mean(rollout_stats["ep_returns"])
             avg_norm_episodic_return = (
                 avg_episodic_return / args.baseline_score if args.baseline_score else 0
             )
             if device_thread_id == 0:
+                # This will be num_steps * log_frequency * local_num_envs
                 print(
                     f"global_step={global_step}, "
                     f"avg_episodic_return={avg_episodic_return}, "
@@ -1028,31 +1042,9 @@ def rollout(
                         )
                     )
 
-                if args.do_recording:
-                    if (
-                        jnp.mean(ev_rollout_stats["ep_returns"])
-                        >= args.recording_threshold
-                    ):
-                        print(f"//// Doing Recording ////")
-
-                        if args.float32_pixels:
-                            frames = [
-                                np.array(
-                                    x.obs[0, :, :, 6:][None].transpose(0, 3, 1, 2) * 255
-                                ).astype(np.uint8)
-                                for x in storage
-                            ]
-                        else:
-                            frames = [
-                                np.array(x.obs[0, :, :, 6:][None].transpose(0, 3, 1, 2))
-                                for x in storage
-                            ]
-                        wandb.log(
-                            {"video": wandb.Video(np.concatenate(frames, 0), fps=30)}
-                        )
-
-                        print(f"returns: {np.sum([x.returns for x in storage])}")
-
+                    
+                
+                # qqq
                 ev_comp_times["rollout"] += time.time() - ev_rollout_time_start
                 if device_thread_id == 0:
                     print(
@@ -1236,7 +1228,7 @@ if __name__ == "__main__":
     run_name_no_uuid = f"{args.env_id}__{args.distractor}__{args.exp_name}__{args.seed}"
     prev_rundir = None
     resume = False
-    
+
     if not resume:
         run_name = f"{run_name_no_uuid}__{uuid.uuid4()}"
         print(f"Starting new run: {run_name}")
@@ -1290,8 +1282,11 @@ if __name__ == "__main__":
 
         rendering_envs_step_fn = jax.jit(rendering_env.step)
 
+    print("made envs.")
+
     agent_state, model_modules, key = make_agent(args, envs, key, print_model=True)
     ACTOR_DISTRIBUTION = model_modules["actor_distribution"]
+    print("made agents.")
 
     runstate = job_util.RunState(checkpoint_path, save_fn=job_util.save_agent_state)
     if resume:
@@ -1394,11 +1389,20 @@ if __name__ == "__main__":
         return adv_pred.squeeze(-1)
 
     @jax.jit
+    def get_auxvalue_and_rep(actor_params: ActorParams, obs: jnp.ndarray):
+        hidden = get_representation(actor_params, obs)
+        aux_value = (
+            ValueHead().apply(actor_params.auxiliary_head_params, hidden).squeeze(-1)
+        )
+        return aux_value, hidden
+
+    @jax.jit
     def get_logprob_entropy(
         actor_params: ActorParams,
         obs: jax.Array,
         actions: jax.Array,
     ):
+        # obs: [1280, 64, 64, 9]
         hidden = get_representation(actor_params, obs)
         mu, sigma = PolicyHead(envs.action_size).apply(
             actor_params.policy_head_params, hidden
@@ -1417,6 +1421,7 @@ if __name__ == "__main__":
         obs: jax.Array,
         actions: jax.Array,
     ):
+        # obs: [1280, 64, 64, 9]
         hidden = get_representation(actor_params, obs)
         mu, sigma = PolicyHead(envs.action_size).apply(
             actor_params.policy_head_params, hidden
@@ -1515,6 +1520,7 @@ if __name__ == "__main__":
         dones,
         rewards,
         target_values,
+        aux_target_values,
         target_mu,
         target_sigma,
         actions,
@@ -1532,18 +1538,22 @@ if __name__ == "__main__":
         vloss, _ = value_loss_fn(value_preds, target_values, None)
 
         # value loss
-        if args.aux_vf_coef_aux_phase > 0.0:
-            aux_vloss, _ = value_loss_fn(aux_value_preds, target_values, None)
+        if args.enable_aux_vf_loss:
+            print("Aux:")
+            print("\tdoing aux_vf_coef_aux_phase")
+            aux_vloss, _ = value_loss_fn(aux_value_preds, aux_target_values, None)
         else:
             aux_vloss = 0.0
 
         if args.adv_coef_aux_phase > 0.0:
+            print("\tdoing adv_coef_aux_phase")
             adv_pred = get_auxadv(params.actor_params, reps_a, actions)
             adv_loss = ((adv_pred - target_advantages) ** 2).mean()
         else:
             adv_loss = jnp.zeros_like(vloss)
 
         if args.bc_coef > 0.0:
+            print("\tdoing bc")
             # computing (estimating) the KL div
             p = ACTOR_DISTRIBUTION.create_dist(
                 jnp.concatenate([target_mu, target_sigma], -1)
@@ -1558,11 +1568,13 @@ if __name__ == "__main__":
             kl_policy_bc = jnp.zeros_like(vloss)
 
         # dynamic prediction loss
+        print("\tAlways doing markov a for PPG, but could be 0 coef")
         dyna_loss_a, key = ddcpg_dynamic_pred_loss_fn(
             params.actor_params.dyna_head_params, reps_a, actions, nreps_a, key
         )
 
         if args.markov_coef_c_aux_phase > 0.0:
+            print("\tdoing markov c")
             dyna_loss_c, key = ddcpg_dynamic_pred_loss_fn(
                 params.critic_params.dyna_head_params, reps_c, actions, nreps_c, key
             )
@@ -1570,6 +1582,7 @@ if __name__ == "__main__":
             dyna_loss_c = jnp.zeros_like(vloss)
 
         if args.mico_coef_critic_aux_phase > 0.0:
+            print("\tdoing mico c")
             target_reps_c = get_representation(target_params.critic_params, obs)
             target_nreps_c = get_representation(target_params.critic_params, next_obs)
             mico_loss, mico_stats = mico_reward_diff_loss_fn(
@@ -1579,6 +1592,7 @@ if __name__ == "__main__":
             mico_loss, mico_stats = jnp.zeros_like(vloss), {}
 
         if args.mico_coef_actor_aux_phase > 0.0:
+            print("\tdoing mico a")
             target_reps_a = get_representation(target_params.actor_params, obs)
             target_nreps_a = get_representation(target_params.actor_params, next_obs)
             mico_loss_a, mico_stats_a = mico_reward_diff_loss_fn(
@@ -1603,6 +1617,7 @@ if __name__ == "__main__":
         )
         aux_phase_loss = aux_phase_loss_actor + aux_phase_loss_critic
 
+        print("\tdoing tgt params update")
         new_target_p = jax.tree_map(update_target_params, target_params, params)
 
         stats = {
@@ -1649,7 +1664,7 @@ if __name__ == "__main__":
                 label="losses/z_logits_tv_actor_aux_phase",
             )
         )
-        
+
         return aux_phase_loss, (stats, new_target_p, key)
 
     def compute_gae_once(carry, inp, gamma, gae_lambda):
@@ -1666,16 +1681,16 @@ if __name__ == "__main__":
 
     @jax.jit
     def compute_gae(
-        agent_state: AgentTrainState,
-        last_obs: np.ndarray,
+        value_preds: jnp.ndarray,
+        last_value: jnp.ndarray,
         last_done: np.ndarray,
         last_term: np.ndarray,
         storage: PolPhaseStorage,
     ):
-        last_value = get_value(agent_state.get_params().critic_params, last_obs)
+        last_value = jax.lax.stop_gradient(last_value)
         advantages = jnp.zeros_like(last_value)
         dones = jnp.concatenate([storage.dones, last_done[None, :]], axis=0)
-        values = jnp.concatenate([storage.values, last_value[None, :]], axis=0)
+        values = jnp.concatenate([value_preds, last_value[None, :]], axis=0)
         terms = jnp.concatenate([storage.terminations, last_term[None, :]], axis=0)
         _, advantages = jax.lax.scan(
             compute_gae_once,
@@ -1683,8 +1698,9 @@ if __name__ == "__main__":
             (dones[1:], terms[1:], values[1:], values[:-1], storage.rewards),
             reverse=True,
         )
+        # handle the extra timestep in envpool
         advantages = jnp.where(dones[:-1], 0, advantages)
-        target_values = jnp.where(storage.terminations, 0, advantages + storage.values)
+        target_values = jnp.where(storage.terminations, 0, advantages + value_preds)
 
         return advantages, target_values
 
@@ -1735,7 +1751,6 @@ if __name__ == "__main__":
         rewards,
         actions,
         behavior_logprobs,
-        stored_value_preds,
         advantages,
         target_values,
         key,
@@ -1755,74 +1770,39 @@ if __name__ == "__main__":
         pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
         entropy_loss = entropy.mean()
 
-        # Value loss
-        value_preds, reps_c = get_value_and_rep(params.critic_params, obs)
-        v_loss, (unclipped_v_loss, clipped_v_loss) = ppo_value_loss_fn(
-            value_preds, target_values, stored_value_preds
+        # DCPG is different because, in DCPG:
+        # - for critic, we use the target_values (i.e. no value regularisation)
+        # - for the aux head, old_value_preds is replaced by old_aux_value_preds, computed using the target actor
+        old_aux_value_preds, target_reps_a = jax.lax.stop_gradient(
+            get_auxvalue_and_rep(target_params.actor_params, obs)
         )
-        # print(f'v_loss: {v_loss.shape}')
-
-        # Thus begin the auxiliary losses
-        if args.markov_coef_a_pol_phase > 0.0:
-            nreps_a = get_representation(params.actor_params, next_obs)
-            dyna_loss_a, key = ddcpg_dynamic_pred_loss_fn(
-                params.actor_params.dyna_head_params, reps_a, actions, nreps_a, key
-            )
+        aux_value_preds = (
+            ValueHead()
+            .apply(params.actor_params.auxiliary_head_params, reps_a)
+            .squeeze(-1)
+        )
+        if args.enable_aux_vf_loss:
+            aux_vloss, _ = ppo_value_loss_fn(aux_value_preds, old_aux_value_preds, None)
         else:
-            dyna_loss_a = jnp.zeros_like(pg_loss)
-
-        if args.markov_coef_c_pol_phase > 0.0:
-            nreps_c = get_representation(params.critic_params, next_obs)
-            dyna_loss_c, key = ddcpg_dynamic_pred_loss_fn(
-                params.critic_params.dyna_head_params, reps_c, actions, nreps_c, key
-            )
-        else:
-            dyna_loss_c = jnp.zeros_like(v_loss)
-
-        if args.mico_coef_critic_pol_phase > 0.0:
-            target_reps_c = get_representation(target_params.critic_params, obs)
-            target_nreps_c = get_representation(target_params.critic_params, next_obs)
-            mico_loss, mico_stats = mico_reward_diff_loss_fn(
-                rewards, reps_c, target_reps_c, target_nreps_c
-            )
-        else:
-            mico_loss, mico_stats = jnp.zeros_like(v_loss), {}
-
-        if args.mico_coef_actor_pol_phase > 0.0:
-            target_reps_a = get_representation(target_params.actor_params, obs)
-            target_nreps_a = get_representation(target_params.actor_params, next_obs)
-            mico_loss_a, mico_stats_a = mico_reward_diff_loss_fn(
-                rewards, reps_a, target_reps_a, target_nreps_a
-            )
-            mico_stats.update({f"{k}_a": v for k, v in mico_stats_a.items()})
-        else:
-            mico_loss_a = jnp.zeros_like(mico_loss)
+            aux_vloss = jnp.zeros_like(pg_loss)
+        value_preds, reps_c = get_value_and_rep(params.critic_params, obs)
+        v_loss, _ = ppo_value_loss_fn(value_preds, target_values, None)
 
         loss = (
             pg_loss
             - args.ent_coef * entropy_loss
-            + v_loss * args.vf_coef
-            + args.markov_coef_a_pol_phase * dyna_loss_a
-            + args.markov_coef_c_pol_phase * dyna_loss_c
-            + args.mico_coef_actor_pol_phase * mico_loss_a
-            + args.mico_coef_critic_pol_phase * mico_loss
+            + args.v_dist_coef * aux_vloss
+            + v_loss
         )
-
-        # PPG reference code does this regardless of aux losses in the policy phase
-        new_target_p = jax.tree_map(update_target_params, target_params, params)
 
         stats = {
             "losses/policy_phase_loss": loss,
             "losses/policy_loss": pg_loss,
             "losses/entropy": entropy_loss,
             "losses/approx_kl": approx_kl,
-            "losses/mico_loss_a": mico_loss_a,
-            "losses/mico_loss_c": mico_loss,
-            "losses/markov_loss_a": dyna_loss_a,
-            "losses/markov_loss_c": dyna_loss_c,
         }
 
-        return loss, (stats, new_target_p, key)
+        return loss, stats
 
     @jax.jit
     def run_policy_phase_single_device(
@@ -1839,14 +1819,31 @@ if __name__ == "__main__":
         last_term = jnp.concatenate(sharded_last_term)
         num_sharded_storages = len(sharded_storages)
 
+        del sharded_storages, sharded_last_obs, sharded_last_done, sharded_last_term
+
+        # Note: not the most memory efficient
         next_obs = jnp.concatenate([storage.obs[1:], last_obs[None, :]], axis=0)
 
         policy_phase_loss_grad_fn = jax.value_and_grad(
             policy_phase_loss_fn, has_aux=True
         )
-        advantages_raw, target_values = compute_gae(
-            agent_state, last_obs, last_done, last_term, storage
+        last_value, _ = get_value_and_rep(
+            agent_state.get_params().critic_params, last_obs
         )
+        # aux_loss_grad_fn = jax.value_and_grad(aux_loss_fn, has_aux=True)
+        advantages_raw, target_values = compute_gae(
+            storage.values, last_value, last_done, last_term, storage
+        )
+
+        if args.singular_value_targets:
+            aux_target_values = target_values
+        else:
+            last_aux_value, _ = get_auxvalue_and_rep(
+                agent_state.get_params().actor_params, last_obs
+            )
+            _, aux_target_values = compute_gae(
+                storage.aux_values, last_aux_value, last_done, last_term, storage
+            )
 
         if args.norm_adv == "batch":
             advantages = (advantages_raw - advantages_raw.mean()) / (
@@ -1863,7 +1860,9 @@ if __name__ == "__main__":
         else:
             advantages = advantages_raw
 
-        def shuffle_storage(storage, advantages, target_values, next_obs, key):
+        def shuffle_storage(
+            storage, advantages, target_values, aux_target_values, next_obs, key
+        ):
             def flatten(x):
                 return x.reshape((-1,) + x.shape[2:])
 
@@ -1880,11 +1879,14 @@ if __name__ == "__main__":
             flatten_storage = jax.tree_map(flatten, storage)
             flatten_advantages = flatten(advantages)
             flatten_target_values = flatten(target_values)
+            flatten_aux_target_values = flatten(aux_target_values)
+            flatten_next_obs = flatten(next_obs)
+
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
             shuffled_advantages = convert_data(flatten_advantages)
             shuffled_target_values = convert_data(flatten_target_values)
-
-            flatten_next_obs = flatten(next_obs)
+            shuffled_aux_target_values = convert_data(flatten_aux_target_values)
+            # mask next_obs when done to break spurious correlation between last and first obs of next episode
             next_obs_mask = jnp.broadcast_to(
                 flatten_storage.dones.reshape(-1, 1, 1, 1), flatten_next_obs.shape
             )
@@ -1896,6 +1898,7 @@ if __name__ == "__main__":
                 shuffled_storage,
                 shuffled_advantages,
                 shuffled_target_values,
+                shuffled_aux_target_values,
                 shuffled_next_obs,
             )
 
@@ -1906,53 +1909,66 @@ if __name__ == "__main__":
                 shuffled_storage,
                 shuffled_advantages,
                 shuffled_target_values,
+                shuffled_aux_target_values,
                 shuffled_next_obs,
-            ) = shuffle_storage(storage, advantages, target_values, next_obs, subkey)
+            ) = shuffle_storage(
+                storage, advantages, target_values, aux_target_values, next_obs, subkey
+            )
 
             def policy_phase_minibatch(agent_state, minibatch):
                 agent_state, key = agent_state
                 (
                     mb_obs,
-                    mb_actions,
-                    mb_rewards,
                     mb_next_obs,
+                    mb_rewards,
+                    mb_actions,
                     mb_behavior_logprobs,
-                    mb_value_preds,
                     mb_advantages,
                     mb_target_values,
                 ) = minibatch
-                (loss, (stats_pol_phase, target_params, key)), grads = (
-                    policy_phase_loss_grad_fn(
+                (loss, stats_pol_phase), grads = policy_phase_loss_grad_fn(
+                    agent_state.get_params(),
+                    agent_state.get_target_params(),
+                    mb_obs,
+                    mb_next_obs,
+                    mb_rewards,
+                    mb_actions,
+                    mb_behavior_logprobs,
+                    mb_advantages,
+                    mb_target_values,
+                    key,
+                )
+                grads = jax.lax.pmean(grads, axis_name="local_devices")
+                agent_state = agent_state.apply_gradients(grads=grads)
+
+                if args.aux_during_ppo:
+                    print("Doing aux during ppo")
+                    # Aux losses go here!
+                    (aux_loss, (stats_pol_phase, key)), grads = aux_loss_grad_fn(
                         agent_state.get_params(),
                         agent_state.get_target_params(),
                         mb_obs,
                         mb_next_obs,
                         mb_rewards,
                         mb_actions,
-                        mb_behavior_logprobs,
-                        mb_value_preds,
-                        mb_advantages,
-                        mb_target_values,
                         key,
                     )
-                )
-                grads = jax.lax.pmean(grads, axis_name="local_devices")
-                agent_state = agent_state.apply_gradients(grads=grads)
-                agent_state = agent_state.replace(
-                    actor_target_params=target_params.actor_params,
-                    critic_target_params=target_params.critic_params,
-                )
+                    grads = jax.lax.pmean(grads, axis_name="local_devices")
+                    agent_state = agent_state.apply_gradients(grads=grads)
+                else:
+                    aux_loss = 0
+
+                return (agent_state, key), stats_pol_phase
 
             agent_state, stats_pol_phase = jax.lax.scan(
                 policy_phase_minibatch,
                 (agent_state, key),
                 (
                     shuffled_storage.obs,
-                    shuffled_storage.actions,
-                    shuffled_storage.rewards,
                     shuffled_next_obs,
+                    shuffled_storage.rewards,
+                    shuffled_storage.actions,
                     shuffled_storage.logprobs,
-                    shuffled_storage.values,
                     shuffled_advantages,
                     shuffled_target_values,
                 ),
@@ -1973,9 +1989,9 @@ if __name__ == "__main__":
             stats_pol_phase,
             jnp.hsplit(target_values, num_sharded_storages),
             jnp.hsplit(advantages_raw, num_sharded_storages),
+            jnp.hsplit(aux_target_values, num_sharded_storages),
             key,
         )
-        # return agent_state, stats_pol_phase, jnp.hsplit(target_values, num_sharded_storages), jnp.hsplit(advantages_raw, num_sharded_storages), key
 
     def compute_bc_target_logits_once(obs, actor_params):
         return jax.lax.stop_gradient(get_logits(actor_params, obs))
@@ -1985,8 +2001,6 @@ if __name__ == "__main__":
         # prevents excessive memory usage.
         # e.g., [10, 10, 54, 54, 9] -> [2, 50, 54, 54, 9]
         obs = storage.obs.reshape((-1, args.aux_minibatch_size) + storage.obs.shape[2:])
-        # TODO (minor): compare two options to improve performance
-        # logits = jnp.array([compute_bc_target_logits_once(ob, actor_params) for ob in obs]) #for loop, long compile time but faster execution
         compute_logit_fn = partial(
             compute_bc_target_logits_once, actor_params=actor_params
         )
@@ -2010,12 +2024,11 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         storage = jax.tree_map(lambda *x: jnp.hstack(x), *sharded_storages)
+        del sharded_storages
         old_pi_mu, old_pi_sigma = compute_bc_target_logits(
             agent_state.get_params().actor_params, storage
         )
         last_obs = jnp.concatenate(sharded_last_obs)
-        # old_pi_logits = compute_bc_target_single_pass(agent_state.get_params().actor_params, storage) #faster, but memory inefficient
-        # aux_loss_grad_fn = jax.value_and_grad(auxiliary_phase_loss_fn, has_aux=True)
         aux_loss_grad_fn = jax.value_and_grad(aux_loss_fn, has_aux=True)
 
         if args.norm_adv == "batch":
@@ -2072,6 +2085,7 @@ if __name__ == "__main__":
                     mb_dones,
                     mb_rewards,
                     mb_target_values,
+                    mb_aux_target_values,
                     mb_mu,
                     mb_sigma,
                     mb_actions,
@@ -2101,6 +2115,7 @@ if __name__ == "__main__":
                         mb_dones,
                         mb_rewards,
                         mb_target_values,
+                        mb_aux_target_values,
                         mb_mu,
                         mb_sigma,
                         mb_actions,
@@ -2112,7 +2127,6 @@ if __name__ == "__main__":
                 grads = jax.lax.pmean(grads, axis_name="local_devices")
                 agent_state = agent_state.apply_gradients(grads=grads)
 
-                # grads = jax.tree_map(lambda x: x * 0.0, grads)
                 agent_state = agent_state.replace(
                     actor_target_params=target_params.actor_params,
                     critic_target_params=target_params.critic_params,
@@ -2128,6 +2142,7 @@ if __name__ == "__main__":
                     shuffled_storage.dones,
                     shuffled_storage.rewards,
                     shuffled_storage.target_values,
+                    shuffled_storage.aux_target_values,
                     shuffled_mu,
                     shuffled_sigma,
                     shuffled_storage.actions,
@@ -2193,7 +2208,7 @@ if __name__ == "__main__":
                     daemon=False,
                 ).start()
 
-        print(f"Started the thread but moving on...")
+        print("Started the thread but moving on...")
         rollout_queue_get_time = jnp.zeros((1,))
         learner_policy_version = runstate.metadata["learner_policy_version"]
         training_phase_start = time.time()
@@ -2210,7 +2225,6 @@ if __name__ == "__main__":
             sharded_last_terms_pol_phase = []
             for d_idx, d_id in enumerate(args.actor_device_ids):
                 for thread_id in range(args.num_actor_threads):
-                    # print(f'Waiting for data from thread...')
                     (
                         global_step,
                         actor_policy_version,
@@ -2222,19 +2236,26 @@ if __name__ == "__main__":
                         avg_params_queue_get_time,
                         device_thread_id,
                     ) = rollout_queues[d_idx * args.num_actor_threads + thread_id].get()
+                    # print(f'Just got via get().......')
                     sharded_storages_pol_phase.append(sharded_storage)
                     sharded_last_obss_pol_phase.append(sharded_last_obs)
                     sharded_last_dones_pol_phase.append(sharded_last_done)
                     sharded_last_terms_pol_phase.append(sharded_last_term)
-            
             rollout_queue_get_time += time.time() - rollout_queue_get_time_start
             training_time_start = time.time()
 
+            brk = False
+            issue0, issue1, issue2, issue3 = "None!", "None!", "None!", "None!"
+            nan_check = jax.tree_map(
+                lambda x: jnp.isnan(x).sum(), sharded_storages_pol_phase
+            )
+            
             (
                 agent_state,
                 stats_pol_phase,
                 target_values,
                 target_advantages,
+                aux_target_values,
                 learner_keys,
             ) = run_policy_phase_multi_device(
                 agent_state,
@@ -2252,6 +2273,7 @@ if __name__ == "__main__":
                         actions=sharded_storages_pol_phase[i].actions,
                         target_values=target_values[i],
                         target_advantages=target_advantages[i],
+                        aux_target_values=aux_target_values[i],
                         dones=sharded_storages_pol_phase[i].dones,
                     )
                     for i in range(len(sharded_storages_pol_phase))
@@ -2285,7 +2307,7 @@ if __name__ == "__main__":
                     )
                 )
                 gc.collect()
-                
+
             unreplicated_params = flax.jax_utils.unreplicate(agent_state.get_params())
             for d_idx, d_id in enumerate(args.actor_device_ids):
                 device_params = jax.device_put(unreplicated_params, local_devices[d_id])
@@ -2353,6 +2375,9 @@ if __name__ == "__main__":
                 break
             # make sure we don't get extra updates due to checkpointing in middle of policy phase
             if learner_policy_version % args.num_policy_phases == 0:
+                # print(f'About to runstate.apply_signals()...')
+                # pass
+                runstate.apply_signals(learner_policy_version, agent_state, args)
                 if 0 < args.checkpoint_frequency < (time.time() - last_checkpoint_time):
                     print(
                         f"Saving periodic checkpoint at iteration {learner_policy_version}"
@@ -2364,8 +2389,13 @@ if __name__ == "__main__":
         if args.distributed:
             jax.distributed.shutdown()
 
+        job_util.save_agent_state(checkpoint_path, agent_state)
+        checkpoints.save_checkpoint(
+          ckpt_dir=f'{checkpoint_path}',
+          target=flax.jax_utils.unreplicate(agent_state),
+          step=0
+        )
         aps = flax.jax_utils.unreplicate(agent_state)  # .get_params().actor_params
-        
         params = {
             "src": {
                 "actor": aps.get_params().actor_params,
@@ -2378,9 +2408,9 @@ if __name__ == "__main__":
         }
 
         job_util.save_params(path=checkpoint_path, params=params)
-        
 
     if args.measure_mi:
+        print("Successfully skipped everything and are here! Amazing!")
         from mutual_info_brax import (
             evaluate_mi,
             compute_mi_levelset,
@@ -2415,18 +2445,7 @@ if __name__ == "__main__":
                 num_rollouts=args.mi_eval_downsample_to_n // args.num_steps,
             ),
         ]
-
-        mi_stats_test = evaluate_mi(
-            envs,
-            eval_envs,
-            flax.jax_utils.unreplicate(agent_state),
-            model_modules,
-            eval_fns_test,
-            seed=args.seed,
-            total_timesteps=args.mi_eval_total_timesteps,
-            num_envs=args.num_envs,
-        )
-        pprint(mi_stats_test)
+        print("Starting MI eval on train set")
         mi_stats_train = evaluate_mi(
             envs,
             eval_envs,
@@ -2439,6 +2458,7 @@ if __name__ == "__main__":
             compute_mi_levels=True,
         )
         pprint(mi_stats_train)
+        print("Uploading MI eval results to wandb/tensorboard")
 
         for k, v in mi_stats_test.items():
             if k.startswith("walltime"):
@@ -2451,7 +2471,6 @@ if __name__ == "__main__":
             else:
                 writer.add_scalar(f"rep_eval_train/{k}", v, args.total_timesteps + 2)
         # runstate.after_post_eval(agent_state, args)
-        time.sleep(4)
+        print("MI eval completed.")
 
-    # envs.close()
     writer.close()
